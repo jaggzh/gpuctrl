@@ -308,6 +308,7 @@ set_fan() {
     
     if [[ $fans_set -gt 0 ]]; then
         echo "${bgre}✓${rst} GPU ${clr_val}$gpu${rst} fans set to ${clr_val}${percent}%${rst} (${fans_set} channel(s): ${fan_indices[*]})"
+        echo "  ${yel}Fan speed change takes a moment and may not reflect immediately in status.$rst"
         return 0
     else
         echo "${bred}✗${rst} Failed to set fans for GPU $gpu" >&2
