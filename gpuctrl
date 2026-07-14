@@ -1,0 +1,631 @@
+#!/bin/bash
+
+# gpuctrl - Emergency-first GPU power and fan management
+# Supports symlinks: gpufans, gpustop
+
+verbose=0
+echo_cmd=(printf "%s")
+if which choq &>/dev/null; then echo_cmd=(choq); fi
+se() {
+	local l=$1
+	shift
+	[[ "$verbose" -ge "$l" ]] && "${echo_cmd[@]}" "$@"
+}
+
+# ANSI Colors
+red=$'\e[31m'; gre=$'\e[32m'; bro=$'\e[33m'; blu=$'\e[34m'; mag=$'\e[35m'; cya=$'\e[36m'; gra=$'\e[90m'
+bred=$'\e[31;1m'; bgre=$'\e[32;1m'; yel=$'\e[33;1m'; bblu=$'\e[34;1m'; bmag=$'\e[35;1m'; bcya=$'\e[36;1m'; whi=$'\e[37;1m'
+bgred=$'\e[41m'; bggre=$'\e[42m'; bgbro=$'\e[43m'; bgblu=$'\e[44m'; bgmag=$'\e[45m'; bgcya=$'\e[46m'; bggra=$'\e[100m'
+rst=$'\e[0m'
+
+# Color aliases for help
+clr_str=$bmag
+clr_val=$yel
+
+# Debug output: dsay <level> <label> [info...]
+# level = minimum verbosity (-v count) required to show
+# label = stage header; pure whitespace = use as indent prefix, no bracket
+dsay() {
+    local level=$1; shift
+    [[ "$verbose" -lt "$level" ]] && return
+    local label=$1; shift
+    if [[ "$label" =~ ^[[:space:]]*$ ]]; then
+        printf "%s%s\n" "$label" "$*"
+    elif [[ $# -gt 0 ]]; then
+        printf "${gra}[${cya}%s${gra}]${rst} %s\n" "$label" "$*"
+    else
+        printf "${gra}[${cya}%s${gra}]${rst}\n" "$label"
+    fi
+}
+
+# Detect if we should use colors
+use_color=yes
+[[ ! -t 1 ]] && use_color=no
+
+# Config file location
+config_dir="$HOME/.config/gpu-controls"
+config_file="$config_dir/config.yaml"
+
+# Xauthority cache
+xauth_cache_dir="$HOME/.local/share/gpustat"
+xauth_cache_file="$xauth_cache_dir/Xauthority"
+
+# Default values (can be overridden by config)
+def_range_min_watts=150
+def_range_max_watts=350
+def_abs_min_watts=100
+def_emergency_watts=200
+def_emergency_fan_percent=80
+def_ultra_low_watts=120
+
+# Load config if exists
+load_config() {
+    [[ ! -f "$config_file" ]] && return
+    
+    while IFS=': ' read -r key value; do
+        key=$(echo "$key" | tr -d ' ' | sed 's/#.*//')
+        value=$(echo "$value" | tr -d ' ' | sed 's/#.*//')
+        [[ -z "$key" || -z "$value" ]] && continue
+        
+        case "$key" in
+            range_min_watts) def_range_min_watts=$value ;;
+            range_max_watts) def_range_max_watts=$value ;;
+            abs_min_watts) def_abs_min_watts=$value ;;
+            emergency_watts) def_emergency_watts=$value ;;
+            emergency_fan_percent) def_emergency_fan_percent=$value ;;
+            ultra_low_watts) def_ultra_low_watts=$value ;;
+        esac
+    done < "$config_file"
+}
+
+# Disable colors if requested
+disable_colors() {
+    red=''; gre=''; bro=''; blu=''; mag=''; cya=''; gra=''
+    bred=''; bgre=''; yel=''; bblu=''; bmag=''; bcya=''; whi=''
+    bgred=''; bggre=''; bgbro=''; bgblu=''; bgmag=''; bgcya=''; bggra=''
+    rst=''
+    clr_str=''; clr_val=''
+}
+
+# Help line formatter
+helpline() {
+    local line=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            s) shift; line+="${clr_str}$1${rst} " ;;
+            v) shift; line+="${clr_val}$1${rst} " ;;
+            d) shift; line+="$1" ;;
+            *) line+="$1 " ;;
+        esac
+        shift
+    done
+    echo "$line"
+}
+
+show_help() {
+    cat << EOF | less
+
+$bblu[$yel*$bblu] ${whi}GPU Control - Emergency-first GPU power and fan management${rst}
+
+${bmag}EMERGENCY USAGE (no thinking required):${rst}
+  gpuctrl                      Emergency defaults: safe power + high fans
+  gpufans                      Same - works as any symlink name
+  gpustop                      Ultra-low power mode (passive cooling)
+
+${bmag}QUICK POWER CONTROL:${rst}
+  $(helpline "gpuctrl pwr" v 250 d "Set both GPUs to 250W")
+  $(helpline "gpuctrl w" v 200 d "Short form")
+  $(helpline "gpuctrl" v 250 d "Just number = watts (if >10)")
+  $(helpline "gpuctrl" v 5 d "Single digit = 50% of max (5*10%)")
+  $(helpline "gpuctrl -0" v 250 d "GPU 0 only")
+  $(helpline "gpuctrl -1" v 200 d "GPU 1 only")
+
+${bmag}QUICK FAN CONTROL:${rst}
+  $(helpline "gpufans" v 50 d "50% fan speed both GPUs")
+  $(helpline "gpufans" v "80%" d "% symbol tolerated")
+  $(helpline "gpufans -0" v 70 d "GPU 0 fans to 70%")
+  $(helpline "gpuctrl fan" v 60 d "Explicit fan command")
+  gpuctrl ${clr_str}{auto|a}${rst}           Return all GPUs to auto fan curve
+  gpuctrl ${clr_str}-0${rst} ${clr_str}{auto|a}${rst}        Return GPU 0 to auto fan curve
+
+${bmag}COMBINED CONTROL:${rst}
+  $(helpline "gpuctrl fan" v 50 s "pwr" v 250 d "Fans 50%, power 250W")
+  $(helpline "gpuctrl f" v 80 s "p" v 300 d "Short forms")
+  $(helpline "gpuctrl -0 f" v 90 s "p" v 200 d "GPU 0 specific")
+
+${bmag}STATUS (many aliases because we're tired):${rst}
+  gpuctrl ${clr_str}{stats|stat|st|s|info|i|status}${rst}  Show current state
+
+${bmag}CONFIG MANAGEMENT:${rst}
+  Config file: ${clr_val}$config_file${rst}
+  gpuctrl ${clr_str}--set-range-min${rst} ${clr_val}150${rst}
+  gpuctrl ${clr_str}--set-range-max${rst} ${clr_val}350${rst}
+  gpuctrl ${clr_str}--set-emergency-watts${rst} ${clr_val}200${rst}
+  gpuctrl ${clr_str}--set-emergency-fan${rst} ${clr_val}80${rst}
+  gpuctrl ${clr_str}--show-config${rst}        Display current config
+
+${bmag}OPTIONS:${rst}
+  -h, --help           Show this help (does NOT change settings)
+  -C, --color          Force color output even when piped
+  -v, --verbose        Increase verbosity (eg. -v -v)
+  -0, --gpu 0          Target GPU 0 only
+  -1, --gpu 1          Target GPU 1 only
+  (no GPU flag)        Target all GPUs (safe default)
+
+${bmag}CURRENT DEFAULTS:${rst}
+  Range: ${clr_val}${def_range_min_watts}W${rst} - ${clr_val}${def_range_max_watts}W${rst}
+  Emergency: ${clr_val}${def_emergency_watts}W${rst} @ ${clr_val}${def_emergency_fan_percent}%${rst} fans
+  Ultra-low: ${clr_val}${def_ultra_low_watts}W${rst}
+
+EOF
+}
+
+# Find a working XAUTHORITY for :0 by scanning /proc for a user process
+# that has DISPLAY=:0 and a valid xauth cookie. Returns path via stdout.
+find_xauthority() {
+    local uid
+    uid=$(id -u)
+    dsay 1 "find_xauthority" "scanning /proc for DISPLAY=:0 + XAUTHORITY..."
+    for environ in /proc/[0-9]*/environ; do
+        [[ -r "$environ" ]] || continue
+        [[ $(stat -c %u "$environ" 2>/dev/null) == "$uid" ]] || continue
+
+        local env_content
+        env_content=$(cat "$environ" 2>/dev/null | tr '\0' '\n')
+        [[ -n "$env_content" ]] || continue
+
+        echo "$env_content" | grep -q '^DISPLAY=:0$' || continue
+        dsay 2 "  " "$environ has DISPLAY=:0"
+
+        local xa
+        xa=$(echo "$env_content" | grep '^XAUTHORITY=' | cut -d= -f2-)
+        dsay 2 "  " "XAUTHORITY=$xa"
+        [[ -n "$xa" && -f "$xa" ]] || { dsay 2 "  " "skipping: file missing"; continue; }
+
+        if xauth -f "$xa" list 2>/dev/null | grep -q ':0[[:space:]]'; then
+            dsay 1 "find_xauthority" "found: $xa"
+            echo "$xa"
+            return 0
+        else
+            dsay 2 "  " "skipping: no :0 cookie in $xa"
+            dsay 3 "  " "xauth contents: $(xauth -f "$xa" list 2>/dev/null | head -3)"
+        fi
+    done
+    dsay 1 "find_xauthority" "no match found"
+    return 1
+}
+
+# Write discovered path to cache
+cache_xauthority() {
+    local xa=$1
+    mkdir -p "$xauth_cache_dir"
+    echo "$xa" > "$xauth_cache_file"
+}
+
+# Run nvidia-settings with current DISPLAY/:0 xauth, retrying once if it fails
+# by re-discovering the XAUTHORITY and updating cache.
+# Usage: nvidia_settings_cmd [nvidia-settings args...]
+nvidia_settings_cmd() {
+    local xa
+
+    # Try cached path first
+    if [[ -f "$xauth_cache_file" ]]; then
+        xa=$(cat "$xauth_cache_file")
+        dsay 1 "nvidia_settings_cmd" "using cached XAUTHORITY: $xa"
+    fi
+
+    # Attempt the call
+    if [[ -n "$xa" && -f "$xa" ]]; then
+        dsay 2 "nvidia_settings_cmd" "trying: DISPLAY=:0 XAUTHORITY=$xa nvidia-settings $*"
+        if DISPLAY=:0 XAUTHORITY="$xa" sudo -E nvidia-settings "$@" >/dev/null 2>&1; then
+            return 0
+        fi
+        dsay 1 "nvidia_settings_cmd" "cached path failed, rediscovering..."
+    fi
+
+    # Cache missing, stale, or call failed — rediscover
+    xa=$(find_xauthority) || {
+        echo "${bred}✗${rst} Could not find X authority for :0 — is a local session running?" >&2
+        return 1
+    }
+    cache_xauthority "$xa"
+    dsay 1 "nvidia_settings_cmd" "retrying with: $xa"
+
+    DISPLAY=:0 XAUTHORITY="$xa" sudo -E nvidia-settings "$@" >/dev/null 2>&1
+}
+
+# Get GPU count
+get_gpu_count() {
+    nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | head -1
+}
+
+# Set power limit
+set_power() {
+    local gpu=$1
+    local watts=$2
+    
+    if sudo nvidia-smi -i "$gpu" -pl "$watts" &>/dev/null; then
+        echo "${bgre}✓${rst} GPU ${clr_val}$gpu${rst} power set to ${clr_val}${watts}W${rst}"
+        return 0
+    else
+        echo "${bred}✗${rst} Failed to set GPU $gpu power" >&2
+        return 1
+    fi
+}
+
+# Set fan to auto mode
+set_fan_auto() {
+    local gpu=$1
+    
+    # Disable manual fan control (back to auto)
+    if nvidia_settings_cmd -a "[gpu:$gpu]/GPUFanControlState=0"; then
+        echo "${bgre}✓${rst} GPU ${clr_val}$gpu${rst} fans set to ${clr_str}auto${rst} (BIOS curve)"
+        return 0
+    else
+        echo "${bred}✗${rst} Failed to set GPU $gpu fans to auto" >&2
+        return 1
+    fi
+}
+
+# Set fan speed for a GPU
+set_fan() {
+    local gpu=$1
+    local percent=$2
+    
+    # Enable manual fan control
+    if ! nvidia_settings_cmd -a "[gpu:$gpu]/GPUFanControlState=1"; then
+        echo "${bred}✗${rst} Failed to enable manual fan control for GPU $gpu" >&2
+        return 1
+    fi
+    
+    # Map fans to this GPU using even division: nvidia numbers fans sequentially
+    # across GPUs (gpu0→fan0..N-1, gpu1→fanN..2N-1, etc.). We get the total
+    # fan count and GPU count, divide evenly, then only set our slice.
+    local xa; xa=$(cat "$xauth_cache_file" 2>/dev/null)
+    local fan_count gpu_count fans_per_gpu fan_start fan_end
+    local fans_set=0
+    local fan_indices=()
+
+    fan_count=$(DISPLAY=:0 XAUTHORITY="$xa" nvidia-settings -q fans 2>/dev/null | grep -c 'fan:')
+    gpu_count=$(get_gpu_count)
+
+    if [[ $fan_count -eq 0 ]]; then
+        echo "${bred}✗${rst} No fans reported by nvidia-settings" >&2
+        return 1
+    fi
+
+    fans_per_gpu=$(( fan_count / gpu_count ))
+    [[ $fans_per_gpu -lt 1 ]] && fans_per_gpu=1
+    fan_start=$(( gpu * fans_per_gpu ))
+    fan_end=$(( fan_start + fans_per_gpu - 1 ))
+
+    for ((fan=fan_start; fan<=fan_end; fan++)); do
+        if nvidia_settings_cmd -a "[fan:$fan]/GPUTargetFanSpeed=$percent"; then
+            fan_indices+=($fan)
+            ((fans_set++))
+        fi
+    done
+    
+    if [[ $fans_set -gt 0 ]]; then
+        echo "${bgre}✓${rst} GPU ${clr_val}$gpu${rst} fans set to ${clr_val}${percent}%${rst} (${fans_set} channel(s): ${fan_indices[*]})"
+        return 0
+    else
+        echo "${bred}✗${rst} Failed to set fans for GPU $gpu" >&2
+        return 1
+    fi
+}
+
+
+# Show current status
+show_status() {
+    echo "${whi}${bgblu} GPU STATUS ${rst}"
+    echo
+    
+	local c=(nvidia-smi --query-gpu=index,name,temperature.gpu,fan.speed,power.draw,power.limit --format=csv,noheader)
+    local output
+    dsay 1 "show_status" "running: ${c[*]}"
+    output=$("${c[@]}" 2>/dev/null)
+    
+    if [[ -z "$output" ]]; then
+        echo "${bred}✗${rst} Failed to query GPU status"
+        return 1
+    fi
+    dsay 2 "show_status" "raw output:"$'\n'"$output"
+    
+    while IFS=, read -r idx name temp fan power limit; do
+        idx=$(echo "$idx" | xargs)
+        name=$(echo "$name" | xargs)
+        temp=$(echo "$temp" | xargs)
+        fan=$(echo "$fan" | xargs)
+        power=$(echo "$power" | xargs)
+        limit=$(echo "$limit" | xargs)
+        
+        echo "${bmag}GPU $idx:${rst} $name"
+        
+        # Colorize temp based on severity
+        local temp_num=${temp%.*}
+        local temp_color=$gre
+        [[ $temp_num -ge 75 ]] && temp_color=$yel
+        [[ $temp_num -ge 85 ]] && temp_color=$bro
+        [[ $temp_num -ge 90 ]] && temp_color=$bred
+        
+        # echo "  Temp:  ${temp_color}${temp}°C${rst}"
+        # echo "  Fan:   ${clr_val}${fan}${rst}"
+        # echo "  Power: ${clr_val}${power}${rst} / ${limit}"
+        printf " Temp: ${temp_color}%3s°C${rst}  Fan: ${clr_val}%3s${rst}  Power: ${clr_val}%s${rst} / %s" "${temp}" "${fan}" "${power}" "$limit"
+        echo
+    done <<< "$output"
+}
+
+# Parse watts/percentage from argument
+parse_value() {
+    local val=$1
+    local type=${2:-watts}  # watts or percent
+    
+    # Strip W/% suffix (case insensitive)
+    val=${val%[Ww]}
+    val=${val%\%}
+    val=${val// /}  # Remove spaces
+    
+    # If single digit (0-9), treat as percentage level
+    if [[ $val =~ ^[0-9]$ ]]; then
+        if [[ $type == "watts" ]]; then
+            # Convert digit to percentage of max (9 = 100%)
+            local pct=$((val * 10))
+            [[ $val -eq 9 ]] && pct=100
+            val=$((def_range_max_watts * pct / 100))
+            # Clamp to range
+            [[ $val -lt $def_range_min_watts ]] && val=$def_range_min_watts
+        else
+            # Fan percent (9 = 100%)
+            val=$((val * 10))
+            [[ $val -eq 9 ]] && val=100
+        fi
+    fi
+    
+    # Validate range for watts
+    if [[ $type == "watts" ]]; then
+        [[ $val -lt $def_abs_min_watts ]] && val=$def_abs_min_watts
+        [[ $val -gt $def_range_max_watts ]] && val=$def_range_max_watts
+    else
+        # Fan percent: allow >100% as nvidia-settings supports it on some cards
+        [[ $val -lt 0 ]] && val=0
+    fi
+    
+    echo "$val"
+}
+
+# Save config setting
+save_config() {
+    local key=$1
+    local value=$2
+    
+    mkdir -p "$config_dir"
+    
+    # Remove old value if exists
+    if [[ -f "$config_file" ]]; then
+        sed -i "/^${key}:/d" "$config_file"
+    fi
+    
+    echo "${key}: ${value}" >> "$config_file"
+    echo "${bgre}✓${rst} Set ${clr_str}${key}${rst} to ${clr_val}${value}${rst}"
+}
+
+# Main function
+main() {
+    load_config
+    
+    local ourname=$(basename "$0")
+    local target_gpus=()
+    local gpu_count
+    gpu_count=$(get_gpu_count)
+    
+    if [[ -z "$gpu_count" || "$gpu_count" -eq 0 ]]; then
+        echo "${bred}✗${rst} No NVIDIA GPUs found"
+        exit 1
+    fi
+    
+    # Default: all GPUs
+    for ((i=0; i<gpu_count; i++)); do
+        target_gpus+=($i)
+    done
+    
+    local do_emergency=""
+    local fan_value=""
+    local power_value=""
+    local fan_auto=no
+    local action_taken=no
+    local next_is_value=""
+    
+    # Detect emergency mode from name
+    case "$ourname" in
+        gpustop|gpusstop)
+            do_emergency=ultra
+            ;;
+    esac
+    
+    # No args = emergency
+    if [[ $# -eq 0 ]]; then
+        do_emergency=yes
+    fi
+
+    for a in "$@"; do
+    	if [[ "$a" = -v || "$a" = --verbose ]]; then
+			((verbose++))
+		fi
+	done
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help|help)
+                show_help
+                exit 0
+                ;;
+            -v|--verbose)
+				# already handled in pre-pass
+				shift
+				;;
+            -C|--color)
+                use_color=yes
+                shift
+                ;;
+            -0)
+                target_gpus=(0)
+                shift
+                ;;
+            -1)
+                target_gpus=(1)
+                shift
+                ;;
+            --gpu)
+                shift
+                target_gpus=($1)
+                shift
+                ;;
+            stats|stat|st|s|info|i|status)
+                show_status
+                exit 0
+                ;;
+            auto|a)
+                fan_auto=yes
+                shift
+                ;;
+            --set-range-min)
+                shift
+                save_config "range_min_watts" "$1"
+                exit 0
+                ;;
+            --set-range-max)
+                shift
+                save_config "range_max_watts" "$1"
+                exit 0
+                ;;
+            --set-emergency-watts)
+                shift
+                save_config "emergency_watts" "$1"
+                exit 0
+                ;;
+            --set-emergency-fan)
+                shift
+                save_config "emergency_fan_percent" "$1"
+                exit 0
+                ;;
+            --set-ultra-low-watts)
+                shift
+                save_config "ultra_low_watts" "$1"
+                exit 0
+                ;;
+            --show-config)
+                if [[ -f "$config_file" ]]; then
+                    cat "$config_file"
+                else
+                    echo "No config file at ${clr_val}$config_file${rst}"
+                    echo
+                    echo "Default values:"
+                    echo "  range_min_watts: $def_range_min_watts"
+                    echo "  range_max_watts: $def_range_max_watts"
+                    echo "  abs_min_watts: $def_abs_min_watts"
+                    echo "  emergency_watts: $def_emergency_watts"
+                    echo "  emergency_fan_percent: $def_emergency_fan_percent"
+                    echo "  ultra_low_watts: $def_ultra_low_watts"
+                fi
+                exit 0
+                ;;
+            fan|fans|f)
+                next_is_value=fan
+                shift
+                ;;
+            pwr|power|watts|watt|w|p)
+                next_is_value=power
+                shift
+                ;;
+            *)
+                # Naked number or value
+                if [[ "$1" =~ ^[0-9]+%?[Ww]?$ ]]; then
+                    local val="$1"
+                    
+                    # Determine type based on context
+                    if [[ -n "$next_is_value" ]]; then
+                        # We know what type from previous keyword
+                        if [[ "$next_is_value" == "fan" ]]; then
+                            fan_value=$(parse_value "$val" percent)
+                        else
+                            power_value=$(parse_value "$val" watts)
+                        fi
+                        next_is_value=""
+                    else
+                        # Guess based on script name or value
+                        if [[ "$ourname" == "gpufans" ]]; then
+                            fan_value=$(parse_value "$val" percent)
+                        else
+                            power_value=$(parse_value "$val" watts)
+                        fi
+                    fi
+                else
+                    dsay 1 "main" "unrecognized argument: '$1' (ignored)"
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Disable colors if not outputting to terminal and -C not specified
+    [[ "$use_color" == "no" ]] && disable_colors
+    
+    # Execute emergency mode
+    if [[ "$do_emergency" == "yes" ]]; then
+        echo "${whi}${bgred} EMERGENCY MODE ${rst}"
+        echo "Setting safe power and fan levels for all GPUs..."
+        echo
+        
+        for gpu in "${target_gpus[@]}"; do
+            set_power "$gpu" "$def_emergency_watts"
+            set_fan "$gpu" "$def_emergency_fan_percent"
+        done
+        action_taken=yes
+        
+    elif [[ "$do_emergency" == "ultra" ]]; then
+        echo "${whi}${bgred} ULTRA-LOW POWER MODE ${rst}"
+        echo "Setting minimal power (passive cooling sufficient)..."
+        echo
+        
+        for gpu in "${target_gpus[@]}"; do
+            set_power "$gpu" "$def_ultra_low_watts"
+            set_fan "$gpu" "100"
+        done
+        action_taken=yes
+    fi
+    
+    # Execute power changes
+    if [[ -n "$power_value" ]]; then
+        for gpu in "${target_gpus[@]}"; do
+            set_power "$gpu" "$power_value"
+        done
+        action_taken=yes
+    fi
+    
+    # Execute fan changes
+    if [[ -n "$fan_value" ]]; then
+        for gpu in "${target_gpus[@]}"; do
+            set_fan "$gpu" "$fan_value"
+        done
+        action_taken=yes
+    fi
+    
+    # Execute fan auto mode
+    if [[ "$fan_auto" == "yes" ]]; then
+        for gpu in "${target_gpus[@]}"; do
+            set_fan_auto "$gpu"
+        done
+        action_taken=yes
+    fi
+    
+    # Always show status after action
+    if [[ "$action_taken" == "yes" ]]; then
+        echo
+        show_status
+    fi
+}
+
+main "$@"
