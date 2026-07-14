@@ -144,6 +144,8 @@ ${bmag}CONFIG MANAGEMENT:${rst}
   gpuctrl ${clr_str}--set-emergency-fan${rst} ${clr_val}80${rst}
   gpuctrl ${clr_str}--show-config${rst}        Display current config
 
+  **-range-** options can limit accidentally-typed values.
+
 ${bmag}OPTIONS:${rst}
   -h, --help           Show this help (does NOT change settings)
   -C, --color          Force color output even when piped
